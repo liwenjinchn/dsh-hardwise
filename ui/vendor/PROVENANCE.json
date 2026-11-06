@@ -1,0 +1,15 @@
+{
+  "source": "Adobe Spectrum 2 local component bundle; see included upstream license and content hashes",
+  "snapshot_date": "2026-11-03",
+  "runtime": "local official Spectrum 2 IIFE, React 19 / ReactDOM 19; independent page only",
+  "files": {
+    "SourceHanSans-LICENSE.txt": "fcac737e761ec63dbfbdce11030a1780161920d80315edba9c8beff1c2bac5a2",
+    "SourceHanSansCN-VF.woff2": "7087698d52240614659957608d8c4ad446759aee3208409dc9f566412e7af8f4",
+    "Spectrum-LICENSE": "7dfe6526888bac51759c99f9a51262ba2711a8c12a067f2181609dd9a4066b84",
+    "Spectrum-NOTICE.txt": "378e1af1aac41d8383e9da1b2acbd2adca2ff8a4c4ad5fdecc8fbffff831eaf7",
+    "react-dom.js": "6d30e033449a53bd5e7a6dfc92fdbde7901874dd4d6c9d5d43726a0e7ca73948",
+    "react.js": "335a7d5343b6755ac818357d91b066932a989015d66acc63a6173b61f9dc818f",
+    "spectrum2.css": "0c86cff3cd833af1cc3895902cdf5835b928b7f4b8b99cad165b219fed0303d2",
+    "spectrum2.js": "eca7ca46b290e0a2f54b0c43e607aa853cd4e30ff2ad63570879035d7835ed4f"
+  }
+}

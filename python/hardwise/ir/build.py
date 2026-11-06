@@ -1,0 +1,213 @@
+"""Aggregator from parse-level records to V2 IR Design.
+
+KiCad path (V2.1): ``build_design(registry)`` — pulls components +
+NC pin records out of the BoardRegistry the parser already populates.
+
+Allegro netlist paths (V2.5): ``build_design_from_netlist()`` handles
+Telesis-style single-file netlists, and ``build_design_from_pst()``
+handles Capture/Allegro PST handoff directories.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from urllib.parse import urlparse
+
+from hardwise.ir.connectivity import ConnectionDeclaration
+from hardwise.ir.connectivity_graph import with_connectivity
+from hardwise.ir.identity_sources import attach_mpn_sources, is_mpn_field
+from hardwise.adapters.allegro_netlist import AllegroNetlistRegistry
+from hardwise.adapters.allegro_pst import AllegroPstRegistry
+from hardwise.adapters.base import BoardRegistry, NcPinRecord
+from hardwise.ir.profile import DatasheetProfile
+from hardwise.ir.types import Component, Design, Pin
+
+
+def _build_pin_from_nc(nc: NcPinRecord) -> Pin:
+    """Convert one ``NcPinRecord`` (parse-level) into a Pin (IR-level).
+
+    ``is_nc`` is always True because an NcPinRecord only exists when the
+    schematic placed an explicit ``no_connect`` marker. ``net`` is left
+    as None — NC pins are not connected to any net.
+    """
+    return Pin(
+        number=nc.pin_number,
+        name=nc.pin_name,
+        electrical_type=nc.pin_electrical_type,
+        is_nc=True,
+        net=None,
+    )
+
+
+def build_design(registry: BoardRegistry, profile_dir: Path | None = None) -> Design:
+    """Aggregate a KiCad-parsed BoardRegistry into a V2 Design.
+
+    Each ComponentRecord becomes one Component. NcPinRecord rows are
+    grouped by refdes and attached as ``Pin`` objects on the matching
+    Component. V2.1 leaves ``Design.nets`` empty — schematic-side net
+    parsing is V2.5+. Components whose refdes has no NcPinRecord get
+    an empty pin list (no shared mutable default).
+    """
+    nc_by_refdes: dict[str, list[NcPinRecord]] = {}
+    for nc in registry.nc_pins:
+        nc_by_refdes.setdefault(nc.refdes, []).append(nc)
+
+    components: dict[str, Component] = {}
+    for record in registry.components:
+        pins = [_build_pin_from_nc(nc) for nc in nc_by_refdes.get(record.refdes, [])]
+        components[record.refdes] = Component(
+            refdes=record.refdes,
+            value=record.value,
+            package=record.footprint or None,
+            datasheet_path=record.datasheet or None,
+            datasheet_profile=_try_load_profile(record.datasheet, profile_dir),
+            pins=pins,
+        )
+
+    return Design(
+        components=components,
+        nets={},
+        project_path=registry.project_dir,
+        source_eda="kicad",
+    )
+
+
+def build_design_from_netlist(registry: AllegroNetlistRegistry) -> Design:
+    """Aggregate an Allegro/Telesis netlist registry into a V2 Design.
+
+    Telesis netlists provide connectivity, not datasheet identity. Each
+    package refdes becomes a Component, and every net endpoint becomes a
+    non-NC Pin with its ``net`` populated. Datasheet fields stay empty so
+    datasheet-driven checks skip rather than guessing.
+    """
+    components: dict[str, Component] = {}
+    for package in registry.packages:
+        for refdes in package.refdes_list:
+            components[refdes] = Component(
+                refdes=refdes,
+                value=package.device_name,
+                package=package.package_name,
+            )
+
+    # Only explicit MPN fields carry manufacturer identity; device names are library facts.
+    by_refdes: dict[str, list[dict[str, str]]] = {}
+    for index, prop in enumerate(registry.properties, start=1):
+        if not is_mpn_field(prop.name) or not prop.value.strip():
+            continue
+        for refdes in prop.targets:
+            if refdes not in components:
+                raise ValueError(
+                    f"{registry.source_file}#A_PROPERTIES[{index}]: explicit MPN target {refdes} is absent from the component registry"
+                )
+            by_refdes.setdefault(refdes, []).append(
+                {
+                    "field": prop.name,
+                    "value": prop.value,
+                    "source": f"{registry.source_file}#A_PROPERTIES[{index}];refdes={refdes}",
+                }
+            )
+    for refdes, component in components.items():
+        components[refdes] = attach_mpn_sources(component, by_refdes.get(refdes, []))
+
+    base = Design(
+        components=components,
+        project_path=registry.source_file.parent,
+        source_eda="allegro_netlist",
+    )
+    declarations = [
+        ConnectionDeclaration(
+            source=str(registry.source_file),
+            line=net.source_line,
+            net_name=net.name,
+            nodes=net.nodes,
+        )
+        for net in registry.nets
+    ]
+    return with_connectivity(base, declarations)
+
+
+def build_design_from_pst(registry: AllegroPstRegistry) -> Design:
+    """Aggregate a Capture/Allegro PST registry into a V2 Design.
+
+    PST exports split schematic facts across part, net, and primitive
+    files. Parts become Components, ``NODE_NAME`` rows become connected
+    Pins, and primitive body fields are preserved as component properties
+    without inventing datasheet links.
+    """
+    components: dict[str, Component] = {}
+    for part in registry.parts:
+        value = part.properties.get("VALUE", part.primitive_name)
+        package = part.properties.get("JEDEC_TYPE")
+        components[part.refdes] = Component(
+            refdes=part.refdes,
+            value=value,
+            package=package,
+            part_number=part.properties.get("PART_NAME"),
+            properties=part.properties,
+        )
+
+    for part in registry.parts:
+        records = [
+            {
+                "field": name,
+                "value": value,
+                "source": f"{registry.chip_file or registry.source_dir}#primitive={part.primitive_name};field={name}",
+            }
+            for name, value in part.properties.items()
+            if is_mpn_field(name) and value.strip()
+        ]
+        components[part.refdes] = attach_mpn_sources(components[part.refdes], records)
+
+    # Preserve consistent pin labels; conflicting labels are not arbitrarily chosen.
+    labels: dict[tuple[str, str], set[str]] = {}
+    for net in registry.nets:
+        for node in net.nodes:
+            labels.setdefault((node.refdes, node.pin_number), set()).add(node.pin_name)
+    for (refdes, number), names in labels.items():
+        components[refdes].pins.append(
+            Pin(
+                number=number,
+                name=next(iter(names)) if len(names) == 1 else "",
+                electrical_type="",
+                is_nc=False,
+            )
+        )
+    base = Design(
+        components=components,
+        project_path=registry.source_dir,
+        source_eda="allegro_netlist",
+    )
+    declarations = [
+        ConnectionDeclaration(
+            source=str(registry.net_file),
+            line=net.source_line,
+            net_name=net.name,
+            nodes=[(node.refdes, node.pin_number) for node in net.nodes],
+        )
+        for net in registry.nets
+    ]
+    return with_connectivity(base, declarations)
+
+
+def _try_load_profile(
+    datasheet_path: str,
+    profile_dir: Path | None = None,
+) -> DatasheetProfile | None:
+    """Load a datasheet profile by datasheet basename, if present."""
+
+    if not datasheet_path:
+        return None
+    basename = _datasheet_stem(datasheet_path)
+    if not basename:
+        return None
+    root = profile_dir or Path("data/datasheet_profiles")
+    path = root / f"{basename}.json"
+    if not path.exists():
+        return None
+    return DatasheetProfile.load(path)
+
+
+def _datasheet_stem(datasheet_path: str) -> str:
+    parsed = urlparse(datasheet_path)
+    path = parsed.path if parsed.scheme else datasheet_path
+    return Path(path).stem

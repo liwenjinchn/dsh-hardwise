@@ -1,0 +1,62 @@
+{
+  "name": "dsh-hardwise",
+  "version": "0.3.0",
+  "description": "Sourced Cadence/Telesis revision comparisons and a persistent local review ledger for DSH",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "backend.js",
+    "client.js",
+    "cordis.patch.yml",
+    "ui",
+    "python",
+    "requirements.txt",
+    "README.md",
+    "LICENSE",
+    "workspace.js",
+    "workspace.css",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "engines": {
+    "node": ">=22",
+    "dsh": "0.2.2-rc.1"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-tool",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ],
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.1"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "package": "python3 scripts/build_client.py && npm pack --ignore-scripts",
+    "build": "python3 scripts/build_client.py"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/liwenjinchn/dsh-hardwise.git"
+  },
+  "homepage": "https://github.com/liwenjinchn/dsh-hardwise#readme",
+  "bugs": {
+    "url": "https://github.com/liwenjinchn/dsh-hardwise/issues"
+  }
+}

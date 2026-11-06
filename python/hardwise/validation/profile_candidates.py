@@ -1,0 +1,306 @@
+"""Suggest explicit validation targets from a schematic BOM and local profiles."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+from typing import Literal
+
+from pydantic import BaseModel, Field
+from hardwise.validation.profile_identity_scope import block_identity_candidates
+
+from hardwise.bom.types import Bom, BomItem
+from hardwise.documents.types import DocumentMatchReport
+from hardwise.ir.profile import DatasheetProfile
+from hardwise.validation.profile_candidate_documents import candidates_from_document_identity
+from hardwise.validation.profile_candidate_manifest import render_manifest
+from hardwise.validation.profile_candidate_text import candidates_from_text_identity
+
+if TYPE_CHECKING:
+    from hardwise.ir.types import Design
+
+ProfileCandidateStatus = Literal["matched", "no_result", "ambiguous", "manual_needed"]
+
+
+class ProfileCandidateError(ValueError):
+    """Raised when profile candidate generation cannot proceed."""
+
+
+class ProfileCandidate(BaseModel):
+    """Candidate profile assignment for one BOM item group."""
+
+    refdes: str
+    match_status: ProfileCandidateStatus
+    identity: str
+    identity_kind: str
+    reason: str
+    profile_lifecycle: str | None = None
+    profile: Path | None = None
+    candidates: list[Path] = Field(default_factory=list)
+    item_number: str | None = None
+    source_line: int
+
+
+class ProfileCandidateReport(BaseModel):
+    """Profile candidate manifest over a schematic BOM."""
+
+    project: str
+    status: str = "candidate"
+    bom_file: Path
+    profiles_dir: Path
+    candidates: list[ProfileCandidate] = Field(default_factory=list)
+
+    @property
+    def counts_by_status(self) -> dict[ProfileCandidateStatus, int]:
+        statuses: tuple[ProfileCandidateStatus, ...] = (
+            "matched",
+            "no_result",
+            "ambiguous",
+            "manual_needed",
+        )
+        return {
+            status: sum(candidate.match_status == status for candidate in self.candidates)
+            for status in statuses
+        }
+
+
+def suggest_profile_candidates(
+    bom: Bom,
+    profiles_dir: Path,
+    *,
+    project: str | None = None,
+    document_report: DocumentMatchReport | None = None,
+    design: "Design | None" = None,
+) -> ProfileCandidateReport:
+    """Generate profile candidates for each refdes in a schematic BOM."""
+
+    all_profiles = _load_profiles(profiles_dir, include_unreviewed=True)
+    profiles = [(path, profile) for path, profile in all_profiles if profile.lifecycle != "RETIRED"]
+    quarantined = _profiles_by_part_number(
+        [(path, profile) for path, profile in all_profiles if profile.lifecycle == "RETIRED"]
+    )
+    by_part = _profiles_by_part_number(profiles)
+    candidates = [
+        candidate
+        for item in bom.items
+        for candidate in _candidate_for_item(
+            item,
+            by_part,
+            document_report=document_report,
+            design=design,
+        )
+    ]
+    loaded = {path: profile for path, profile in all_profiles}
+    for candidate in candidates:
+        if candidate.profile in loaded:
+            profile = loaded[candidate.profile]
+            candidate.profile_lifecycle = profile.lifecycle
+            if profile.lifecycle != "READY":
+                candidate.reason += (
+                    f" 档案有效状态 {profile.lifecycle}，仅作候选；未批准检查为UNKNOWN。"
+                )
+    block_identity_candidates(candidates, bom, design)
+    for candidate in candidates:
+        blocked = quarantined.get(_normalize_identity(candidate.identity), [])
+        if candidate.match_status == "no_result" and blocked:
+            candidate.reason = "器件档案已停用（RETIRED）；不参与新评审。"
+            candidate.candidates = blocked
+    return ProfileCandidateReport(
+        project=project or bom.source_file.stem,
+        bom_file=bom.source_file,
+        profiles_dir=profiles_dir,
+        candidates=candidates,
+    )
+
+
+def render_profile_candidate_manifest(
+    report: ProfileCandidateReport,
+    *,
+    matched_only: bool = False,
+) -> str:
+    """Render a YAML candidate manifest for human review."""
+
+    return render_manifest(report, matched_only=matched_only)
+
+
+def _candidate_for_item(
+    item: BomItem,
+    profiles_by_part: dict[str, list[Path]],
+    *,
+    document_report: DocumentMatchReport | None,
+    design: "Design | None",
+) -> list[ProfileCandidate]:
+    identity, identity_kind = _item_identity(item)
+    if identity is None:
+        return [
+            _candidate(
+                refdes=refdes,
+                item=item,
+                status="manual_needed",
+                identity="-",
+                identity_kind=identity_kind,
+                reason="BOM item has no MPN or part-like value for profile matching.",
+            )
+            for refdes in item.refdes_list
+        ]
+
+    profiles = profiles_by_part.get(_normalize_identity(identity), [])
+    if not profiles:
+        document_candidates = candidates_from_document_identity(
+            item,
+            profiles_by_part,
+            document_report=document_report,
+            design=design,
+        )
+        if document_candidates is not None:
+            return [
+                _candidate(
+                    refdes=document_candidate.refdes,
+                    item=item,
+                    status=document_candidate.status,
+                    identity=document_candidate.identity,
+                    identity_kind="document_mpn",
+                    reason=document_candidate.reason,
+                    profile=document_candidate.profile,
+                    candidates=document_candidate.candidates,
+                )
+                for document_candidate in document_candidates
+            ]
+        text_candidates = candidates_from_text_identity(item, profiles_by_part, design=design)
+        if text_candidates is not None:
+            return [
+                _candidate(
+                    refdes=text_candidate.refdes,
+                    item=item,
+                    status=text_candidate.status,
+                    identity=text_candidate.identity,
+                    identity_kind="value_mpn",
+                    reason=text_candidate.reason,
+                    profile=text_candidate.profile,
+                    candidates=text_candidate.candidates,
+                )
+                for text_candidate in text_candidates
+            ]
+        return [
+            _candidate(
+                refdes=refdes,
+                item=item,
+                status="no_result",
+                identity=identity,
+                identity_kind=identity_kind,
+                reason="No local profile part_number matched this BOM identity.",
+            )
+            for refdes in item.refdes_list
+        ]
+    if len(profiles) == 1:
+        return [
+            _candidate(
+                refdes=refdes,
+                item=item,
+                status="matched",
+                identity=identity,
+                identity_kind=identity_kind,
+                reason="Exactly one local profile part_number matched this BOM identity.",
+                profile=profiles[0],
+                candidates=profiles,
+            )
+            for refdes in item.refdes_list
+        ]
+    return [
+        _candidate(
+            refdes=refdes,
+            item=item,
+            status="ambiguous",
+            identity=identity,
+            identity_kind=identity_kind,
+            reason="Multiple local profiles match this BOM identity.",
+            candidates=profiles,
+        )
+        for refdes in item.refdes_list
+    ]
+
+
+def _candidate(
+    *,
+    refdes: str,
+    item: BomItem,
+    status: ProfileCandidateStatus,
+    identity: str,
+    identity_kind: str,
+    reason: str,
+    profile: Path | None = None,
+    candidates: list[Path] | None = None,
+) -> ProfileCandidate:
+    return ProfileCandidate(
+        refdes=refdes,
+        match_status=status,
+        identity=identity,
+        identity_kind=identity_kind,
+        reason=reason,
+        profile=profile,
+        candidates=candidates or [],
+        item_number=item.item_number,
+        source_line=item.source_line,
+    )
+
+
+def _load_profiles(
+    profiles_dir: Path, *, include_unreviewed: bool = False
+) -> list[tuple[Path, DatasheetProfile]]:
+    if not profiles_dir.exists() or not profiles_dir.is_dir():
+        raise ProfileCandidateError(f"profile directory not found: {profiles_dir}")
+    paths = sorted(profiles_dir.glob("*.json"))
+    if not paths:
+        raise ProfileCandidateError(f"profile directory has no JSON profiles: {profiles_dir}")
+
+    profiles: list[tuple[Path, DatasheetProfile]] = []
+    for path in paths:
+        try:
+            profile = DatasheetProfile.load(path)
+            if include_unreviewed or profile.review_status == "ready":
+                profiles.append((path, profile))
+        except Exception as exc:
+            raise ProfileCandidateError(
+                f"failed to load profile {path}: {type(exc).__name__}: {exc}"
+            ) from exc
+    return profiles
+
+
+def _profiles_by_part_number(
+    profiles: list[tuple[Path, DatasheetProfile]],
+) -> dict[str, list[Path]]:
+    by_part: dict[str, list[Path]] = {}
+    for path, profile in profiles:
+        for part_number in [profile.part_number, *profile.part_number_aliases]:
+            key = _normalize_identity(part_number)
+            if key:
+                by_part.setdefault(key, []).append(path)
+    return by_part
+
+
+def _item_identity(item: BomItem) -> tuple[str | None, str]:
+    if item.part_number:
+        return item.part_number, "mpn"
+    if item.value and _looks_like_part_number(item.value):
+        return item.value, "value"
+    return None, "missing"
+
+
+def _looks_like_part_number(value: str) -> bool:
+    text = value.strip().upper()
+    if len(text) < 4:
+        return False
+    if _PASSIVE_VALUE_RE.fullmatch(text.replace(" ", "")):
+        return False
+    return bool(re.search(r"[A-Z]", text) and re.search(r"\d", text))
+
+
+def _normalize_identity(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+_PASSIVE_VALUE_RE = re.compile(
+    r"\d+(\.\d+)?(R|K|M|OHM|Ω|UF|NF|PF|F|UH|NH|H|V|MV|A|MA|%)"
+    r"(\d+)?([A-Z%]+)?"
+)

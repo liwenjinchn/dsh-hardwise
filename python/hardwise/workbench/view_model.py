@@ -1,0 +1,106 @@
+"""Compatibility facade for workbench view contracts and projections.
+
+Callers keep importing this module while implementation responsibilities live
+in focused contract, component, task, and project-state modules.
+"""
+
+from hardwise.workbench.component_projection import (
+    build_component_detail,
+    build_review_prep_packet,
+    render_review_prep_packet_markdown,
+)
+from hardwise.workbench.evidence_package import (
+    EvidencePackageLane,
+    EvidencePackageMetric,
+    EvidencePackageSummary,
+    build_evidence_package_summary,
+)
+from hardwise.workbench.state_projection import (
+    build_pin_table_summary,
+    build_risk_hints_summary,
+    build_risk_hints_view,
+    build_workbench_state,
+)
+from hardwise.workbench.task_projection import (
+    _build_review_tasks_uncached as _build_review_tasks_uncached,
+)
+from hardwise.workbench.task_projection import build_review_tasks
+from hardwise.workbench.view_contracts import (
+    BomView,
+    CheckView,
+    ComponentDetail,
+    ComponentMiss,
+    ComponentTaskCounts,
+    DatasheetCandidateSearchView,
+    DatasheetCandidateView,
+    DocumentCoverageView,
+    EvidenceChainItem,
+    EvidenceView,
+    NetCheckView,
+    PinTableSummary,
+    PinView,
+    ProfileView,
+    RejectedPinTableFindingView,
+    RejectedRiskHintSummary,
+    ReviewPackageArtifactView,
+    ReviewPackageSummary,
+    ReviewPrepPacket,
+    ReviewQueueItem,
+    ReviewTask,
+    ReviewTaskCounts,
+    RiskHintsSummary,
+    RiskHintsView,
+    RiskHintView,
+    StatusGroup,
+    TrustTier,
+    WorkbenchCapabilities,
+    WorkbenchProject,
+    WorkbenchState,
+    WorkbenchSummary,
+)
+
+__all__ = [
+    "BomView",
+    "CheckView",
+    "ComponentDetail",
+    "ComponentMiss",
+    "ComponentTaskCounts",
+    "DatasheetCandidateSearchView",
+    "DatasheetCandidateView",
+    "DocumentCoverageView",
+    "EvidenceChainItem",
+    "EvidencePackageLane",
+    "EvidencePackageMetric",
+    "EvidencePackageSummary",
+    "EvidenceView",
+    "NetCheckView",
+    "PinTableSummary",
+    "PinView",
+    "ProfileView",
+    "RejectedPinTableFindingView",
+    "RejectedRiskHintSummary",
+    "ReviewPackageArtifactView",
+    "ReviewPackageSummary",
+    "ReviewPrepPacket",
+    "ReviewQueueItem",
+    "ReviewTask",
+    "ReviewTaskCounts",
+    "RiskHintView",
+    "RiskHintsSummary",
+    "RiskHintsView",
+    "StatusGroup",
+    "TrustTier",
+    "WorkbenchCapabilities",
+    "WorkbenchProject",
+    "WorkbenchState",
+    "WorkbenchSummary",
+    "build_component_detail",
+    "build_evidence_package_summary",
+    "build_pin_table_summary",
+    "build_review_prep_packet",
+    "build_review_tasks",
+    "build_risk_hints_summary",
+    "build_risk_hints_view",
+    "build_workbench_state",
+    "render_review_prep_packet_markdown",
+]

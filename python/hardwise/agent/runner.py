@@ -1,0 +1,464 @@
+"""Agent main loop — wire ModelRouter + TOOL_DEFINITIONS + Anthropic messages.create.
+
+The loop sequence:
+
+    user_message
+      ↓
+    messages.create(system=cache_control_blocks, tools=TOOL_DEFINITIONS, ...)
+      ↓
+    response.content has tool_use blocks? ─yes→ dispatch each tool, append
+                                                tool_result blocks, repeat
+                                          ─no →  extract final text, return
+
+The agent code never names a specific model — `ModelRouter.select(tier)`
+makes that call from `.env`. The `system_blocks` come from
+`prompts.build_system_blocks()` with `cache_control=ephemeral` so the
+upstream proxy can serve the long static prompt from cache across turns
+(mechanism #5 wiring; whether the upstream actually caches depends on
+provider support and the prompt-size threshold).
+
+Hardware-engineer explanation: this is the part of the agent that actually
+"thinks". The deterministic R001/R002/R003 checks in `checklist/checks/*`
+are the rule-based pass; this loop is the question-answering pass that
+lets a human ask "U3 是什么器件 / NC pin 怎么处理 / datasheet 第几页说了什么".
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from anthropic import Anthropic
+from sqlalchemy.orm import Session
+
+from hardwise.adapters.base import BoardRegistry
+from hardwise.agent.document_tools import (
+    GetComponentDocumentsInput,
+    SummarizeDocumentCoverageInput,
+    document_evidence_tokens,
+    get_component_documents,
+    summarize_document_coverage,
+)
+from hardwise.agent.evidence_locator import (
+    LocateComponentEvidenceInput,
+    evidence_locator_tokens,
+    locate_component_evidence,
+)
+from hardwise.agent.grounding import (
+    evidence_tokens_from_datasheet_hits,
+    trust_tier_for_datasheet_search,
+)
+from hardwise.agent.output_boundary import ResponseKind, usable_tool_payload
+from hardwise.agent.claim_contract import ExplanationReview
+from hardwise.agent.claim_turn import ClaimTurn, OUTPUT_CONTRACT, render_explanation
+from hardwise.agent.prompts import build_system_blocks
+from hardwise.agent.router import ModelRouter, Tier
+from hardwise.agent.tools import (
+    TOOL_DEFINITIONS,
+    GetComponentInput,
+    GetNcPinsInput,
+    ListComponentsInput,
+    RunComponentValidationInput,
+    SearchDatasheetInput,
+    get_component,
+    get_nc_pins,
+    list_components,
+    run_component_validation,
+    search_datasheet,
+)
+from hardwise.agent.topology_tools import (
+    GetComponentContextInput,
+    GetNetContextInput,
+    SearchNetsInput,
+    SummarizeProjectTopologyInput,
+    get_component_context,
+    get_net_context,
+    search_nets,
+    summarize_project_topology,
+)
+from hardwise.guards.refdes import sanitize_args, sanitize_text
+from hardwise.trust import TrustTier
+
+MAX_ITERATIONS = 10
+MAX_TOKENS = 2048
+
+
+@dataclass
+class ToolCallTrace:
+    """One executed tool call: name, input args, short summary of output.
+
+    The `input` and `output_summary` fields are user-visible *copies* that have
+    been passed through the refdes guard — unverified refdes are wrapped as
+    `⟨?XXX⟩`. The raw payload returned to the model is kept separately and never
+    sanitized (preserving the tool-fact channel invariant). `has_result` is set
+    only from a dispatched server tool payload, never from model prose.
+    """
+
+    name: str
+    input: dict
+    output_summary: str
+    wrapped: int = 0
+    evidence: list[str] = field(default_factory=list)
+    trust_tier: TrustTier | None = None
+    has_result: bool = False
+
+
+@dataclass
+class RunResult:
+    """Outcome of one Runner.run() invocation.
+
+    `text` is server-rendered from this turn's verified bindings and then
+    refdes-guard sanitized. Raw model prose never becomes the final answer.
+    Matching a binding does not create a formal assessment. `text_wrapped` counts unverified refdes that were wrapped
+    in `text`; per-trace wraps live on each `ToolCallTrace.wrapped`.
+    """
+
+    text: str
+    tool_calls: list[ToolCallTrace] = field(default_factory=list)
+    iterations: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+    stopped_at_cap: bool = False
+    text_wrapped: int = 0
+    response_kind: ResponseKind = "insufficient_evidence"
+    explanation_review: ExplanationReview | None = None
+
+
+class Runner:
+    """Wire model + tools + messages.create into a finite tool-use loop.
+
+    Construction is cheap. `run(user_message)` runs the loop and returns
+    a `RunResult` carrying final text + tool call trace + token usage.
+    Pass `collection=None` to disable `search_datasheet` (it returns a
+    structured "not configured" message; the agent learns to back off).
+    """
+
+    def __init__(
+        self,
+        client: Anthropic,
+        router: ModelRouter,
+        session: Session,
+        registry: BoardRegistry,
+        collection: Any | None = None,
+        tier: Tier = "normal",
+        max_iterations: int = MAX_ITERATIONS,
+        max_tokens: int = MAX_TOKENS,
+        system_prompt: str | None = None,
+        design: Any | None = None,
+        validation_targets: dict[str, Any] | None = None,
+        project_index: Any | None = None,
+        document_report: Any | None = None,
+    ) -> None:
+        self.client = client
+        self.router = router
+        self.session = session
+        self.registry = registry
+        self.collection = collection
+        self.tier = tier
+        self.max_iterations = max_iterations
+        self.max_tokens = max_tokens
+        self.system_prompt = system_prompt
+        # IR Design + explicit refdes->DatasheetProfile assignments power the
+        # run_component_validation tool. Both default empty so the existing
+        # KiCad-only callers keep working; the tool then reports not_found /
+        # no_profile instead of fabricating a verdict.
+        self.design = design
+        self.validation_targets = validation_targets or {}
+        self.project_index = project_index
+        self.document_report = document_report
+
+    def run(self, user_message: str) -> RunResult:
+        result = RunResult(text="")
+        claim_turn = ClaimTurn(self.registry, self.design)
+        messages: list[dict] = [{"role": "user", "content": user_message}]
+        model = self.router.select(self.tier)
+        system_blocks = (
+            build_system_blocks(self.system_prompt) if self.system_prompt else build_system_blocks()
+        )
+        system_blocks.append({"type": "text", "text": OUTPUT_CONTRACT})
+        system_blocks.append({"type": "text", "text": "Current scope_id: " + claim_turn.scope_id})
+
+        for iteration in range(1, self.max_iterations + 1):
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=self.max_tokens,
+                system=system_blocks,
+                tools=TOOL_DEFINITIONS,
+                messages=messages,
+            )
+            self._accumulate_usage(result, response)
+            tool_uses = [b for b in response.content if getattr(b, "type", None) == "tool_use"]
+
+            if not tool_uses:
+                raw_text = self._extract_text(response.content)
+                result.explanation_review = claim_turn.review(raw_text)
+                rendered, result.response_kind = render_explanation(result.explanation_review)
+                result.text, wrapped = sanitize_text(rendered, self.registry)
+                result.text_wrapped = wrapped
+                result.iterations = iteration
+                return result
+
+            messages.append({"role": "assistant", "content": response.content})
+            tool_results: list[dict] = []
+            for tool_use in tool_uses:
+                tool_result_block, trace = self._dispatch(tool_use)
+                claim_turn.receive(tool_use.name, dict(tool_use.input or {}), tool_result_block)
+                tool_results.append(tool_result_block)
+                result.tool_calls.append(trace)
+            tool_results.append(claim_turn.directory())
+            messages.append({"role": "user", "content": tool_results})
+
+        result.text = "(stopped: iteration cap reached)"
+        result.iterations = self.max_iterations
+        result.stopped_at_cap = True
+        return result
+
+    def _dispatch(self, tool_use: Any) -> tuple[dict, ToolCallTrace]:
+        """Run one tool call; return (tool_result block, trace entry).
+
+        The tool_result block carries the raw payload (model-facing, never
+        sanitized — protects the tool-fact channel). The trace entry is the
+        user-visible copy with refdes-shaped tokens passed through the guard.
+        """
+        name = tool_use.name
+        args = dict(tool_use.input) if tool_use.input else {}
+        evidence: list[str] = []
+        trust_tier: TrustTier | None = None
+        try:
+            if name == "list_components":
+                out = list_components(self.session, ListComponentsInput(**args))
+                summary = f"total={out.total}"
+                payload = out.model_dump_json()
+            elif name == "get_component":
+                out = get_component(self.session, self.registry, GetComponentInput(**args))
+                summary = f"status={out.status}"
+                payload = out.model_dump_json()
+            elif name == "get_nc_pins":
+                out = get_nc_pins(self.session, GetNcPinsInput(**args))
+                summary = f"total={out.total}"
+                payload = out.model_dump_json()
+            elif name == "search_datasheet":
+                if self.collection is None:
+                    summary = "skipped: vector store not configured"
+                    trust_tier = "l3"
+                    payload = json.dumps(
+                        {
+                            "found": False,
+                            "hits": [],
+                            "query": args.get("query", ""),
+                            "error": "vector store not configured for this run",
+                        }
+                    )
+                else:
+                    out = search_datasheet(self.collection, SearchDatasheetInput(**args))
+                    summary = f"hits={len(out.hits)}"
+                    evidence = evidence_tokens_from_datasheet_hits(out.hits)
+                    trust_tier = trust_tier_for_datasheet_search(evidence)
+                    payload = out.model_dump_json()
+            elif name == "run_component_validation":
+                if self.design is None:
+                    summary = "skipped: no design loaded for validation"
+                    trust_tier = "l3"
+                    payload = json.dumps(
+                        {
+                            "status": "not_configured",
+                            "refdes": args.get("refdes", ""),
+                            "error": "no IR design is loaded for this run",
+                        }
+                    )
+                else:
+                    out = run_component_validation(
+                        self.design,
+                        self.validation_targets,
+                        RunComponentValidationInput(**args),
+                    )
+                    summary = f"status={out.status}"
+                    evidence = _validation_evidence(out)
+                    trust_tier = "l1" if out.status == "validated" else "l3"
+                    payload = out.model_dump_json()
+            elif name == "get_component_context":
+                out = get_component_context(
+                    self.design,
+                    self.project_index,
+                    GetComponentContextInput(**args),
+                )
+                summary = f"status={out.status}"
+                evidence = list(getattr(out, "evidence", []) or [])
+                trust_tier = "l3" if out.status == "not_configured" else "l1"
+                payload = out.model_dump_json()
+            elif name == "get_net_context":
+                out = get_net_context(self.design, GetNetContextInput(**args))
+                summary = (
+                    f"members={out.member_count}"
+                    if out.status == "found"
+                    else f"status={out.status}"
+                )
+                trust_tier = "l3" if out.status == "not_configured" else "l1"
+                payload = out.model_dump_json()
+            elif name == "search_nets":
+                out = search_nets(self.design, SearchNetsInput(**args))
+                summary = (
+                    f"hits={len(out.hits)}"
+                    if getattr(out, "found", False)
+                    else f"status={getattr(out, 'status', 'not_found')}"
+                )
+                trust_tier = "l3" if getattr(out, "status", "") == "not_configured" else "l1"
+                payload = out.model_dump_json()
+            elif name == "summarize_project_topology":
+                out = summarize_project_topology(
+                    self.design,
+                    self.project_index,
+                    SummarizeProjectTopologyInput(**args),
+                )
+                summary = (
+                    f"components={out.component_count}, nets={out.net_count}"
+                    if out.status == "summarized"
+                    else f"status={out.status}"
+                )
+                trust_tier = "l3" if out.status == "not_configured" else "l1"
+                payload = out.model_dump_json()
+            elif name == "get_component_documents":
+                out = get_component_documents(
+                    self.project_index,
+                    self.document_report,
+                    GetComponentDocumentsInput(**args),
+                )
+                summary = f"status={out.status}"
+                evidence = document_evidence_tokens(out)
+                trust_tier = "l3" if out.status == "not_configured" else "l1"
+                payload = out.model_dump_json()
+            elif name == "summarize_document_coverage":
+                out = summarize_document_coverage(
+                    self.project_index,
+                    self.document_report,
+                    SummarizeDocumentCoverageInput(**args),
+                )
+                summary = (
+                    f"groups={len(out.groups)}"
+                    if out.status == "configured"
+                    else f"status={out.status}"
+                )
+                evidence = document_evidence_tokens(out)
+                trust_tier = "l3" if out.status == "not_configured" else "l1"
+                payload = out.model_dump_json()
+            elif name == "locate_component_evidence":
+                out = locate_component_evidence(
+                    self.design,
+                    self.validation_targets,
+                    self.project_index,
+                    self.document_report,
+                    LocateComponentEvidenceInput(**args),
+                )
+                summary = f"status={out.status}, hits={len(out.hits)}"
+                evidence = evidence_locator_tokens(out)
+                trust_tier = (
+                    "l1"
+                    if out.found and any(hit.source_kind != "document_coverage" for hit in out.hits)
+                    else "l3"
+                )
+                payload = out.model_dump_json()
+            else:
+                summary = f"unknown tool: {name}"
+                return (
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "content": json.dumps({"error": summary}),
+                        "is_error": True,
+                    },
+                    self._build_trace(name, args, summary),
+                )
+        except Exception as e:  # noqa: BLE001 — surface any tool error to the model
+            summary = f"tool error: {type(e).__name__}: {e}"
+            return (
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.id,
+                    "content": json.dumps({"error": summary}),
+                    "is_error": True,
+                },
+                self._build_trace(name, args, summary),
+            )
+
+        return (
+            {
+                "type": "tool_result",
+                "tool_use_id": tool_use.id,
+                "content": payload,
+            },
+            self._build_trace(
+                name,
+                args,
+                summary,
+                evidence=evidence,
+                trust_tier=trust_tier,
+                has_result=usable_tool_payload(json.loads(payload)),
+            ),
+        )
+
+    def _build_trace(
+        self,
+        name: str,
+        args: dict,
+        summary: str,
+        *,
+        evidence: list[str] | None = None,
+        trust_tier: TrustTier | None = None,
+        has_result: bool = False,
+    ) -> ToolCallTrace:
+        """Assemble a user-visible ToolCallTrace from raw tool inputs/output.
+
+        Sanitizes the args dict and the summary text through the refdes guard so
+        unverified refdes-shaped tokens are wrapped in the copy shown to the user.
+        The raw `args` and `summary` passed in are not mutated.
+        """
+        clean_args, w_args = sanitize_args(args, self.registry)
+        clean_summary, w_sum = sanitize_text(summary, self.registry)
+        return ToolCallTrace(
+            name=name,
+            input=clean_args,
+            output_summary=clean_summary,
+            wrapped=w_args + w_sum,
+            evidence=evidence or [],
+            trust_tier=trust_tier,
+            has_result=has_result,
+        )
+
+    @staticmethod
+    def _extract_text(content: list[Any]) -> str:
+        parts: list[str] = []
+        for block in content:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts).strip()
+
+    @staticmethod
+    def _accumulate_usage(result: RunResult, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        result.input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+        result.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+        result.cache_creation_tokens += int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        result.cache_read_tokens += int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+
+
+def _validation_evidence(out: Any) -> list[str]:
+    """Collect validation evidence tokens from a run_component_validation result."""
+
+    checks = getattr(out, "checks", None)
+    if not isinstance(checks, list):
+        return []
+    tokens: list[str] = []
+    for check in checks:
+        evidence = getattr(check, "evidence", None)
+        if not isinstance(evidence, list):
+            continue
+        for token in evidence:
+            if token and token not in tokens:
+                tokens.append(str(token))
+    return tokens

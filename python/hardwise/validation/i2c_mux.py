@@ -1,0 +1,146 @@
+"""Deterministic I2C mux topology checks."""
+
+from __future__ import annotations
+
+from hardwise.validation.topology_isolation import isolate_topology
+from hardwise.ir.profile import DatasheetProfile
+from hardwise.ir.types import Component, Design, Pin
+from hardwise.validation.family_pin import family_pin_check
+from hardwise.validation.types import ComponentValidation
+
+
+@isolate_topology
+def validate_i2c_mux(
+    component: Component, profile: DatasheetProfile, design: Design
+) -> list[ComponentValidation]:
+    """Validate the selected component as a schematic-side I2C mux."""
+
+    return [
+        _validate_supply(component, profile, design),
+        _validate_upstream_bus(component, profile),
+        _validate_control_pins(component, profile),
+        _validate_channel_pairs(component, profile),
+    ]
+
+
+def _validate_supply(
+    component: Component,
+    profile: DatasheetProfile,
+    design: Design,
+) -> ComponentValidation:
+    pin_profile = next((p for p in profile.pins if p.name.upper() == "VDD"), None)
+    return family_pin_check(component, profile, pin_profile, design, "i2c_mux_vdd")
+
+
+def _validate_upstream_bus(component: Component, profile: DatasheetProfile) -> ComponentValidation:
+    evidence = _profile_evidence(profile, "recommended.upstream_bus")
+    scl = _pin_by_profile_name(component, profile, "SCL")
+    sda = _pin_by_profile_name(component, profile, "SDA")
+    missing = [name for name, pin in [("SCL", scl), ("SDA", sda)] if pin is None or not pin.net]
+    if missing:
+        return ComponentValidation(
+            check="i2c_mux_upstream_bus",
+            result="FAIL",
+            severity="ERROR",
+            summary=f"I2C mux upstream bus pin(s) missing or unconnected: {', '.join(missing)}.",
+            evidence=evidence,
+        )
+    assert scl is not None and sda is not None
+    return ComponentValidation(
+        check="i2c_mux_upstream_bus",
+        result="PASS",
+        severity="INFO",
+        refdes=component.refdes,
+        summary=f"I2C mux upstream SCL/SDA are connected to {scl.net} / {sda.net}.",
+        evidence=evidence,
+    )
+
+
+def _validate_control_pins(component: Component, profile: DatasheetProfile) -> ComponentValidation:
+    evidence = _profile_evidence(profile, "recommended.control_pins")
+    names = ["RESET", "A0", "A1", "A2"]
+    missing = []
+    for name in names:
+        pin = _pin_by_profile_name(component, profile, name)
+        if pin is None or not pin.net:
+            missing.append(name)
+    if missing:
+        return ComponentValidation(
+            check="i2c_mux_control_pins",
+            result="FAIL",
+            severity="ERROR",
+            refdes=component.refdes,
+            summary=f"I2C mux control pin(s) missing or unconnected: {', '.join(missing)}.",
+            evidence=evidence,
+        )
+    return ComponentValidation(
+        check="i2c_mux_control_pins",
+        result="PASS",
+        severity="INFO",
+        refdes=component.refdes,
+        summary="I2C mux reset and address pins are connected for deterministic review.",
+        evidence=evidence,
+    )
+
+
+def _validate_channel_pairs(component: Component, profile: DatasheetProfile) -> ComponentValidation:
+    evidence = _profile_evidence(profile, "recommended.channel_pairs")
+    mismatched = []
+    connected_pairs = 0
+    unused_pairs = 0
+    for channel in range(8):
+        sc = _pin_by_profile_name(component, profile, f"SC{channel}")
+        sd = _pin_by_profile_name(component, profile, f"SD{channel}")
+        sc_connected = _is_connected(sc)
+        sd_connected = _is_connected(sd)
+        if sc_connected and sd_connected:
+            connected_pairs += 1
+        elif not sc_connected and not sd_connected:
+            unused_pairs += 1
+        else:
+            mismatched.append(f"{channel} ({_net(sc) or 'NC'} / {_net(sd) or 'NC'})")
+    if mismatched:
+        return ComponentValidation(
+            check="i2c_mux_channel_pairs",
+            result="FAIL",
+            severity="ERROR",
+            refdes=component.refdes,
+            summary="I2C mux channel SCn/SDn mismatch on channel(s): " + ", ".join(mismatched),
+            evidence=evidence,
+        )
+    return ComponentValidation(
+        check="i2c_mux_channel_pairs",
+        result="PASS",
+        severity="INFO",
+        refdes=component.refdes,
+        summary=(
+            f"I2C mux channel pairs are consistent: {connected_pairs} connected, "
+            f"{unused_pairs} unused/NC."
+        ),
+        evidence=evidence,
+    )
+
+
+def _pin_by_profile_name(component: Component, profile: DatasheetProfile, name: str) -> Pin | None:
+    normalized_name = _normalize_pin_name(name)
+    for pin_profile in profile.pins:
+        if _normalize_pin_name(pin_profile.name) == normalized_name:
+            return component.pin_by_number(pin_profile.number)
+    return None
+
+
+def _is_connected(pin: Pin | None) -> bool:
+    return bool(pin and pin.net and pin.net.upper() != "NC")
+
+
+def _net(pin: Pin | None) -> str | None:
+    return pin.net if pin and pin.net else None
+
+
+def _normalize_pin_name(value: str) -> str:
+    return "".join(ch for ch in value.upper() if ch.isalnum())
+
+
+def _profile_evidence(profile: DatasheetProfile, key: str) -> list[str]:
+    token = profile.evidence.get(key)
+    return [token] if token else []

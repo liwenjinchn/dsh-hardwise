@@ -1,0 +1,5 @@
+# Comparison and local review only; no model SDK or vector store is needed.
+pydantic==2.13.4
+fastapi==0.136.3
+uvicorn==0.46.0
+python-multipart==0.0.32
