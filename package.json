@@ -1,6 +1,6 @@
 {
   "name": "dsh-hardwise",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Sourced Cadence/Telesis revision comparisons and a persistent local review ledger for DSH",
   "type": "module",
   "main": "index.js",
